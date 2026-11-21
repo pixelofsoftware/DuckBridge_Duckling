@@ -1,0 +1,267 @@
+#{
+    Praktyczne zastosowanie wrappera: normalizator głośności plików WAV (np. dźwięków do gry).
+
+    Program czyta ze standardowego wejścia trzy wiersze:
+      1. plik wejściowy (dowolny format czytany przez libsndfile),
+      2. plik wyjściowy (powstanie WAV PCM16 o tej samej częstotliwości i liczbie kanałów),
+      3. docelowy szczyt w procentach pełnej skali, 1-100 (pusty wiersz = 89%, ok. -1 dBFS).
+    Pierwszy przebieg (porcjami) mierzy szczyt i poziom RMS każdego kanału; potem plik jest
+    przewijany na początek i drugi przebieg zapisuje próbki przemnożone tak, aby najgłośniejszy
+    kanał osiągnął docelowy szczyt. Na koniec wynik jest odczytany ponownie i sprawdzony.
+
+    Kod zakończenia: 0 - sukces, 2 - złe parametry, 3 - błąd pliku wejściowego,
+    4 - błąd pliku wyjściowego, 5 - sprawdzenie wyniku się nie zgadza.
+#}
+import core.containers.*;
+import core.primitive_io as io;
+import std.math as math;
+import sndfile;
+
+const PORCJA: i64 = 4096;
+const PELNA_SKALA: i64 = 32767;
+
+class Wiersz {
+    tekst: String;
+    jest: bool = false;
+}
+
+fun czytajWiersz() -> Wiersz = {
+    var w: Wiersz;
+    var znak = io.readCharCode();
+    if (znak < 0) return w;
+    w.jest = true;
+    while (znak >= 0 and znak != '\n' as i32) {
+        if (znak != '\r' as i32) w.tekst.append(znak as char);
+        znak = io.readCharCode();
+    }
+    return w;
+}
+
+fun rowne(a: str, b: str) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a[i] != b[i]) return false;
+        i += 1;
+    }
+    return true;
+}
+
+# Liczba z jednym miejscem po przecinku, np. -6.0.
+fun jednoMiejsce(x: f64) -> String = {
+    var w: String;
+    var dziesiate = (x * 10.0f64) as i64;
+    if (x * 10.0f64 - (dziesiate as f64) >= 0.5f64) dziesiate += 1;
+    if ((dziesiate as f64) - x * 10.0f64 > 0.5f64) dziesiate -= 1;
+    if (dziesiate < 0) {
+        w.append('-');
+        dziesiate = -dziesiate;
+    }
+    w.append((dziesiate / 10).toString());
+    w.append('.');
+    w.append((dziesiate % 10).toString());
+    return w;
+}
+
+# Poziom w dBFS względem pełnej skali 32768.
+fun dbfs(wartosc: f64) -> String = {
+    if (wartosc <= 0.0f64) {
+        var cisza: String;
+        cisza.append("-inf");
+        return cisza;
+    }
+    return jednoMiejsce(20.0f64 * math.log(wartosc / 32768.0f64) / math.log(10.0f64));
+}
+
+fun modul(x: i64) -> i64 = { if (x < 0) return -x; return x; }
+
+# Skalowanie próbki z zaokrągleniem do najbliższej i obcięciem do zakresu i16.
+fun skaluj(probka: i64, cel: i64, szczyt: i64) -> i16 = {
+    var licznik = probka * cel * 2;
+    if (licznik >= 0) licznik += szczyt;
+    else licznik -= szczyt;
+    var wynik = licznik / (2 * szczyt);
+    if (wynik > 32767) wynik = 32767;
+    if (wynik < -32768) wynik = -32768;
+    return wynik as i16;
+}
+
+fun main() -> i64 = {
+    print("Normalizator WAV (wrapper libsndfile). Podaj: plik wejsciowy, plik wyjsciowy, szczyt w % (domyslnie 89).\n");
+    let wejscie = czytajWiersz();
+    let wyjscie = czytajWiersz();
+    let poziom = czytajWiersz();
+    if (not wejscie.jest or not wyjscie.jest or wejscie.tekst.length() == 0 or wyjscie.tekst.length() == 0) {
+        print("Blad: podaj sciezke pliku wejsciowego i wyjsciowego w osobnych wierszach.\n");
+        return 2;
+    }
+    if (rowne(wejscie.tekst.asSlice(), wyjscie.tekst.asSlice())) {
+        print("Blad: plik wyjsciowy musi byc inny niz wejsciowy (zapis zastapilby dane przed odczytem).\n");
+        return 2;
+    }
+    var procent: i64 = 89;
+    if (poziom.jest and poziom.tekst.length() > 0) {
+        var wartosc: i64 = 0;
+        var poprawny = poziom.tekst.length() <= 3;
+        var i: i64 = 0;
+        while (i < poziom.tekst.length()) {
+            let z = poziom.tekst.asSlice()[i];
+            if (z < '0' or z > '9') poprawny = false;
+            else wartosc = wartosc * 10 + ((z as i64) - ('0' as i64));
+            i += 1;
+        }
+        if (not poprawny or wartosc < 1 or wartosc > 100) {
+            print(f"Blad: szczyt musi byc liczba calkowita od 1 do 100, jest '{poziom.tekst.asSlice()}'.\n");
+            return 2;
+        }
+        procent = wartosc;
+    }
+    let cel = (PELNA_SKALA * procent + 50) / 100;
+
+    var we = sndfile.otworzDoOdczytu(wejscie.tekst.asSlice());
+    if (not sndfile.otwarty(&we)) {
+        print(f"Blad: {we.blad.asSlice()}\n");
+        return 3;
+    }
+    let kanaly = we.info.kanaly;
+    print(f"Wejscie: {wejscie.tekst.asSlice()} - {sndfile.typFormatu(&we.info)} {sndfile.kodowanie(&we.info)}, {we.info.czestotliwosc} Hz, {kanaly} kan., {we.info.ramki} ramek\n");
+    if (not sndfile.jestWavPcm16(&we.info)) print("Uwaga: wejscie nie jest WAV PCM16 - probki zostana przeliczone na 16 bitow.\n");
+
+    # Przebieg 1: szczyt i suma kwadratów każdego kanału.
+    var szczyty: List[i64];
+    var kwadraty: List[f64];
+    var k: i64 = 0;
+    while (k < kanaly) { szczyty.push(0); kwadraty.push(0.0f64); k += 1; }
+    var ramek: i64 = 0;
+    var dalej = true;
+    while (dalej) {
+        let porcja = sndfile.czytajRamki(&we, PORCJA);
+        if (not porcja.ok) {
+            print(f"Blad: {porcja.blad.asSlice()}\n");
+            sndfile.zamknij(&we);
+            return 3;
+        }
+        var i: i64 = 0;
+        while (i < porcja.probki.length()) {
+            let kanal = i % kanaly;
+            let surowa: i16 = porcja.probki.at(i);
+            let s = surowa as i64;
+            if (modul(s) > szczyty.at(kanal)) szczyty.at(kanal) = modul(s);
+            kwadraty.at(kanal) = kwadraty.at(kanal) + (s as f64) * (s as f64);
+            i += 1;
+        }
+        ramek += porcja.ramki;
+        dalej = not porcja.koniec;
+    }
+    var szczyt: i64 = 0;
+    var c: i64 = 0;
+    while (c < kanaly) { if (szczyty.at(c) > szczyt) szczyt = szczyty.at(c); c += 1; }
+
+    # Przebieg 2: od początku pliku, przeskalowane próbki do nowego pliku.
+    let przewiniecie = sndfile.przewin(&we, 0);
+    if (not przewiniecie.ok) {
+        print(f"Blad: {przewiniecie.blad.asSlice()}\n");
+        sndfile.zamknij(&we);
+        return 3;
+    }
+    var wy = sndfile.utworzWav16(wyjscie.tekst.asSlice(), we.info.czestotliwosc, kanaly);
+    if (not sndfile.otwarty(&wy)) {
+        print(f"Blad: {wy.blad.asSlice()}\n");
+        sndfile.zamknij(&we);
+        return 4;
+    }
+    var bezZmian = szczyt == 0;
+    if (bezZmian) print("Plik jest cichy (same zera) - zapisuje go bez zmian.\n");
+    var drugi = true;
+    while (drugi) {
+        let porcja = sndfile.czytajRamki(&we, PORCJA);
+        if (not porcja.ok) {
+            print(f"Blad: {porcja.blad.asSlice()}\n");
+            sndfile.zamknij(&we);
+            sndfile.zamknij(&wy);
+            return 3;
+        }
+        var nowe: List[i16];
+        nowe.reserve(porcja.probki.length());
+        var i: i64 = 0;
+        while (i < porcja.probki.length()) {
+            if (bezZmian) nowe.push(porcja.probki.at(i));
+            else {
+                let wartosc: i16 = porcja.probki.at(i);
+                nowe.push(skaluj(wartosc as i64, cel, szczyt));
+            }
+            i += 1;
+        }
+        let zapis = sndfile.zapiszRamki(&wy, &nowe);
+        if (not zapis.ok) {
+            print(f"Blad zapisu: {zapis.blad.asSlice()}\n");
+            sndfile.zamknij(&we);
+            sndfile.zamknij(&wy);
+            return 4;
+        }
+        drugi = not porcja.koniec;
+    }
+    let zamkniecieWe = sndfile.zamknij(&we);
+    let zamkniecieWy = sndfile.zamknij(&wy);
+    if (not zamkniecieWe.ok) print(f"Uwaga: {zamkniecieWe.blad.asSlice()}\n");
+    if (not zamkniecieWy.ok) {
+        print(f"Blad: {zamkniecieWy.blad.asSlice()}\n");
+        return 4;
+    }
+
+    # Sprawdzenie: ponowny odczyt wyniku.
+    var spr = sndfile.otworzDoOdczytu(wyjscie.tekst.asSlice());
+    if (not sndfile.otwarty(&spr)) {
+        print(f"Blad sprawdzenia: {spr.blad.asSlice()}\n");
+        return 5;
+    }
+    var szczytyPo: List[i64];
+    var m: i64 = 0;
+    while (m < kanaly) { szczytyPo.push(0); m += 1; }
+    var trzeci = true;
+    var ramekPo: i64 = 0;
+    while (trzeci) {
+        let porcja = sndfile.czytajRamki(&spr, PORCJA);
+        if (not porcja.ok) {
+            trzeci = false;
+        } else {
+            var i: i64 = 0;
+            while (i < porcja.probki.length()) {
+                let kanal = i % kanaly;
+                let odczytana: i16 = porcja.probki.at(i);
+                let s = modul(odczytana as i64);
+                if (s > szczytyPo.at(kanal)) szczytyPo.at(kanal) = s;
+                i += 1;
+            }
+            ramekPo += porcja.ramki;
+            trzeci = not porcja.koniec;
+        }
+    }
+    let formatWyniku = sndfile.jestWavPcm16(&spr.info);
+    sndfile.zamknij(&spr);
+
+    print("Kanal   Szczyt przed       RMS przed   Szczyt po\n");
+    var n: i64 = 0;
+    var najwiekszyPo: i64 = 0;
+    while (n < kanaly) {
+        var rms: f64 = 0.0f64;
+        if (ramek > 0) rms = math.sqrt(kwadraty.at(n) / (ramek as f64));
+        let szczytPrzed: i64 = szczyty.at(n);
+        let szczytPo: i64 = szczytyPo.at(n);
+        let przed = dbfs(szczytPrzed as f64);
+        let rmsTekst = dbfs(rms);
+        let po = dbfs(szczytPo as f64);
+        print(f"{n + 1}       {szczyty.at(n)} ({przed.asSlice()} dBFS)   {rmsTekst.asSlice()} dBFS   {szczytyPo.at(n)} ({po.asSlice()} dBFS)\n");
+        if (szczytyPo.at(n) > najwiekszyPo) najwiekszyPo = szczytyPo.at(n);
+        n += 1;
+    }
+    var oczekiwany = cel;
+    if (bezZmian) oczekiwany = 0;
+    print(f"Wynik: {wyjscie.tekst.asSlice()} - WAV PCM16, {ramekPo} ramek, najwyzszy szczyt {najwiekszyPo} (cel {oczekiwany}).\n");
+    if (ramekPo != ramek or not formatWyniku or najwiekszyPo != oczekiwany) {
+        print("Blad: sprawdzenie wyniku nie zgadza sie z oczekiwaniem.\n");
+        return 5;
+    }
+    print("Sprawdzenie: liczba ramek, format i szczyt zgodne.\n");
+    return 0;
+}

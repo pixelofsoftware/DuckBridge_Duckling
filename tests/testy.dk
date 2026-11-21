@@ -1,0 +1,326 @@
+# Testy wrappera libsndfile: build.py podstawia ten plik w miejsce app/app.dk.
+# Pliki testowe powstają w bieżącym katalogu (domyślnie katalog budowy).
+# Każde sprawdzenie wypisuje PASS albo FAIL; kod zakończenia to liczba błędów.
+import core.containers.*;
+import core.builtins as builtins;
+import core.clib as clib;
+import sndfile;
+
+extern("C") {
+    fundecl fopen(sciezka: cptr char, tryb: cptr char) -> cptr u8;
+    fundecl fwrite(dane: cptr u8, rozmiar: u64, ile: u64, plik: cptr u8) -> u64;
+    fundecl fread(dane: cptr u8, rozmiar: u64, ile: u64, plik: cptr u8) -> u64;
+    fundecl fclose(plik: cptr u8) -> i32;
+}
+
+fun sprawdz(warunek: bool, nazwa: str) -> i64 = {
+    if (warunek) {
+        print(f"PASS {nazwa}\n");
+        return 0;
+    }
+    print(f"FAIL {nazwa}\n");
+    return 1;
+}
+
+fun zawiera(calosc: str, fragment: str) -> bool = {
+    var i: i64 = 0;
+    while (i + fragment.length() <= calosc.length()) {
+        var zgodne = true;
+        var j: i64 = 0;
+        while (j < fragment.length()) {
+            if (calosc[i + j] != fragment[j]) zgodne = false;
+            j += 1;
+        }
+        if (zgodne) return true;
+        i += 1;
+    }
+    return false;
+}
+
+fun naC(s: str) -> String = {
+    var w: String;
+    w.append(s);
+    w.append('\0');
+    return w;
+}
+
+# Zapis surowych bajtów do pliku (do plików przygotowanych ręcznie).
+fun zapiszBajty(sciezka: str, bajty: ref List[u8]) -> bool = {
+    let nazwa = naC(sciezka);
+    let plik = fopen(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, builtins.ptr_from_slice[char]("wb\0") as cptr char);
+    if (plik as u64 == 0u64) return false;
+    let pamiec = clib.malloc((bajty.length() + 1) as u64);
+    let bufor = pamiec as manyptr u8;
+    var i: i64 = 0;
+    while (i < bajty.length()) { bufor[i] = bajty.at(i); i += 1; }
+    let n = fwrite(pamiec, 1u64, bajty.length() as u64, plik) as i64;
+    clib.free(pamiec);
+    return fclose(plik) == 0i32 and n == bajty.length();
+}
+
+fun czytajBajty(sciezka: str, ile: i64) -> List[u8] = {
+    var wynik: List[u8];
+    let nazwa = naC(sciezka);
+    let plik = fopen(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, builtins.ptr_from_slice[char]("rb\0") as cptr char);
+    if (plik as u64 == 0u64) return wynik;
+    let pamiec = clib.malloc(ile as u64);
+    let n = fread(pamiec, 1u64, ile as u64, plik) as i64;
+    let bufor = pamiec as manyptr u8;
+    var i: i64 = 0;
+    while (i < n) { wynik.push(bufor[i]); i += 1; }
+    clib.free(pamiec);
+    fclose(plik);
+    return wynik;
+}
+
+fun tekstBajty(b: ref List[u8], s: str) -> () = {
+    var i: i64 = 0;
+    while (i < s.length()) { b.push(s[i] as u8); i += 1; }
+}
+
+fun le(b: ref List[u8], wartosc: i64, bajtow: i64) -> () = {
+    var i: i64 = 0;
+    while (i < bajtow) {
+        b.push(((wartosc >> (8 * i)) & 255) as u8);
+        i += 1;
+    }
+}
+
+fun leOdczyt(b: ref List[u8], od: i64, bajtow: i64) -> i64 = {
+    var w: i64 = 0;
+    var i: i64 = bajtow - 1;
+    while (i >= 0) {
+        let bajt: u8 = b.at(od + i);
+        w = w * 256 + (bajt as i64);
+        i -= 1;
+    }
+    return w;
+}
+
+# Wzorzec próbek: wartości graniczne, ujemne i zmienne.
+fun wzorzec(n: i64, kanal: i64) -> i16 = {
+    if (n == 0) {
+        if (kanal == 0) return -32768i16;
+        return 32767i16;
+    }
+    if (n == 1) {
+        if (kanal == 0) return -1i16;
+        return 0i16;
+    }
+    let w = ((n * 7919 + kanal * 104729) % 65536) - 32768;
+    return w as i16;
+}
+
+fun utworzPlik(sciezka: str, czestotliwosc: i64, kanaly: i64, ramek: i64, porcja: i64) -> bool = {
+    var p = sndfile.utworzWav16(sciezka, czestotliwosc, kanaly);
+    if (not sndfile.otwarty(&p)) return false;
+    var ok = true;
+    var r: i64 = 0;
+    while (r < ramek) {
+        var probki: List[i16];
+        var k: i64 = r;
+        while (k < r + porcja and k < ramek) {
+            var c: i64 = 0;
+            while (c < kanaly) { probki.push(wzorzec(k, c)); c += 1; }
+            k += 1;
+        }
+        let w = sndfile.zapiszRamki(&p, &probki);
+        if (not w.ok) ok = false;
+        r += porcja;
+    }
+    let z = sndfile.zamknij(&p);
+    return ok and z.ok and p.info.ramki == ramek;
+}
+
+# Odczyt całego pliku porcjami i porównanie z wzorcem.
+fun zgodnyZWzorcem(sciezka: str, kanaly: i64, ramek: i64, porcja: i64) -> bool = {
+    var p = sndfile.otworzDoOdczytu(sciezka);
+    if (not sndfile.otwarty(&p) or p.info.kanaly != kanaly or p.info.ramki != ramek) return false;
+    var ok = true;
+    var r: i64 = 0;
+    var dalej = true;
+    while (dalej) {
+        let o = sndfile.czytajRamki(&p, porcja);
+        if (not o.ok) {
+            ok = false;
+            dalej = false;
+        } else {
+            var i: i64 = 0;
+            while (i < o.ramki) {
+                var c: i64 = 0;
+                while (c < kanaly) {
+                    if (sndfile.probka(&o.probki, kanaly, i, c) != wzorzec(r + i, c)) ok = false;
+                    c += 1;
+                }
+                i += 1;
+            }
+            r += o.ramki;
+            dalej = not o.koniec;
+        }
+    }
+    sndfile.zamknij(&p);
+    return ok and r == ramek;
+}
+
+fun testyParametrow() -> i64 = {
+    var b: i64 = 0;
+    let wersja = sndfile.wersjaBiblioteki();
+    print(f"  (biblioteka: {wersja.asSlice()})\n");
+    b += sprawdz(zawiera(wersja.asSlice(), "libsndfile-1."), "wersja biblioteki dostepna");
+    b += sprawdz(sndfile.formatPoprawny(44100, 2) and sndfile.formatPoprawny(8000, 1) and sndfile.formatPoprawny(96000, 6), "poprawne parametry WAV PCM16 przyjete");
+    b += sprawdz(not sndfile.formatPoprawny(0, 2) and not sndfile.formatPoprawny(44100, 0) and not sndfile.formatPoprawny(44100, 1025) and not sndfile.formatPoprawny(800000, 2), "zla czestotliwosc i liczba kanalow odrzucone");
+    var zly = sndfile.utworzWav16("zly.wav", 44100, 0);
+    b += sprawdz(not sndfile.otwarty(&zly) and zawiera(zly.blad.asSlice(), "kanalow"), "utworzenie pliku z 0 kanalow: czytelny blad, bez uchwytu");
+    var pusty = sndfile.utworzWav16("", 44100, 2);
+    b += sprawdz(not sndfile.otwarty(&pusty), "pusta sciezka odrzucona");
+    return b;
+}
+
+fun testyStereo() -> i64 = {
+    var b: i64 = 0;
+    b += sprawdz(utworzPlik("stereo.wav", 44100, 2, 1000, 300), "zapis 1000 ramek stereo w porcjach po 300 (zamkniecie sprawdzone)");
+    var p = sndfile.otworzDoOdczytu("stereo.wav");
+    b += sprawdz(sndfile.otwarty(&p) and p.info.czestotliwosc == 44100 and p.info.kanaly == 2 and p.info.ramki == 1000, "odczyt: 44100 Hz, 2 kanaly, 1000 ramek");
+    b += sprawdz(tekstRowny(sndfile.typFormatu(&p.info), "WAV") and tekstRowny(sndfile.kodowanie(&p.info), "PCM_16") and sndfile.jestWavPcm16(&p.info), "format: WAV, PCM_16");
+    b += sprawdz(p.info.przewijalny, "plik WAV jest przewijalny");
+    let dziesiec = sndfile.czytajRamki(&p, 10);
+    b += sprawdz(dziesiec.ok and dziesiec.ramki == 10 and dziesiec.probki.length() == 20, "10 ramek stereo = 20 probek (ramki i probki rozroznione)");
+    b += sprawdz(sndfile.probka(&dziesiec.probki, 2, 0, 0) == -32768i16 and sndfile.probka(&dziesiec.probki, 2, 0, 1) == 32767i16 and sndfile.probka(&dziesiec.probki, 2, 1, 0) == -1i16, "skrajne i ujemne probki zachowane; uklad przeplatany L,P");
+    let w500 = sndfile.przewin(&p, 500);
+    let r500 = sndfile.czytajRamki(&p, 1);
+    b += sprawdz(w500.ok and p.pozycja == 501 and r500.ramki == 1 and sndfile.probka(&r500.probki, 2, 0, 0) == wzorzec(500, 0) and sndfile.probka(&r500.probki, 2, 0, 1) == wzorzec(500, 1), "przewiniecie na ramke 500 i odczyt tej ramki");
+    let reszta = sndfile.czytajRamki(&p, 1000);
+    b += sprawdz(reszta.ok and reszta.ramki == 499 and reszta.koniec, "odczyt do konca: 499 ramek i znacznik konca");
+    let poKoncu = sndfile.czytajRamki(&p, 10);
+    b += sprawdz(poKoncu.ok and poKoncu.ramki == 0 and poKoncu.koniec and poKoncu.probki.length() == 0, "odczyt za koncem: 0 ramek, bez bledu");
+    let naKoniec = sndfile.przewin(&p, 1000);
+    let zaDaleko = sndfile.przewin(&p, 1001);
+    let ujemna = sndfile.przewin(&p, -1);
+    b += sprawdz(naKoniec.ok and not zaDaleko.ok and not ujemna.ok and zawiera(zaDaleko.blad.asSlice(), "poza zakresem"), "przewiniecie: koniec dozwolony, poza zakresem odrzucone");
+    let zero = sndfile.czytajRamki(&p, 0);
+    let duzo = sndfile.czytajRamki(&p, 9000000);
+    b += sprawdz(not zero.ok and not duzo.ok, "porcja 0 ramek i porcja ponad limit probek odrzucone");
+    let z = sndfile.zamknij(&p);
+    b += sprawdz(z.ok, "zamkniecie pliku do odczytu");
+    b += sprawdz(zgodnyZWzorcem("stereo.wav", 2, 1000, 333), "wszystkie 2000 probek zgodne po zapisie i odczycie (porcje po 333)");
+    return b;
+}
+
+fun testyKanalow() -> i64 = {
+    var b: i64 = 0;
+    b += sprawdz(utworzPlik("mono.wav", 8000, 1, 257, 64) and zgodnyZWzorcem("mono.wav", 1, 257, 100), "mono 8000 Hz: zgodnosc probek");
+    b += sprawdz(utworzPlik("szesc.wav", 48000, 6, 500, 77) and zgodnyZWzorcem("szesc.wav", 6, 500, 128), "6 kanalow 48000 Hz: zgodnosc probek");
+    b += sprawdz(utworzPlik("duzy.wav", 44100, 2, 100000, 4096) and zgodnyZWzorcem("duzy.wav", 2, 100000, 8192), "100 000 ramek stereo porcjami: zgodnosc probek");
+    var pusty = sndfile.utworzWav16("pusty.wav", 22050, 2);
+    let zp = sndfile.zamknij(&pusty);
+    var p = sndfile.otworzDoOdczytu("pusty.wav");
+    let o = sndfile.czytajRamki(&p, 16);
+    b += sprawdz(zp.ok and sndfile.otwarty(&p) and p.info.ramki == 0 and o.ok and o.ramki == 0 and o.koniec, "pusty plik: 0 ramek, odczyt od razu konczy sie");
+    sndfile.zamknij(&p);
+    return b;
+}
+
+fun testyBajtow() -> i64 = {
+    var b: i64 = 0;
+    let bajty = czytajBajty("stereo.wav", 52);
+    var naglowek = bajty.length() == 52;
+    if (naglowek) {
+        naglowek = bajty.at(0) == 82u8 and bajty.at(1) == 73u8 and bajty.at(2) == 70u8 and bajty.at(3) == 70u8
+            and bajty.at(8) == 87u8 and bajty.at(9) == 65u8 and bajty.at(10) == 86u8 and bajty.at(11) == 69u8;
+    }
+    b += sprawdz(naglowek, "surowe bajty: naglowek RIFF/WAVE");
+    b += sprawdz(naglowek and leOdczyt(&bajty, 20, 2) == 1 and leOdczyt(&bajty, 22, 2) == 2 and leOdczyt(&bajty, 24, 4) == 44100 and leOdczyt(&bajty, 34, 2) == 16,
+        "surowe bajty: PCM, 2 kanaly, 44100 Hz, 16 bitow");
+    b += sprawdz(naglowek and leOdczyt(&bajty, 40, 4) == 4000 and leOdczyt(&bajty, 44, 2) == 32768 and leOdczyt(&bajty, 46, 2) == 32767 and leOdczyt(&bajty, 48, 2) == 65535,
+        "surowe bajty: 4000 bajtow danych, probki little-endian w kolejnosci L0, P0, L1");
+    # Ręcznie zbudowany WAV 24-bitowy (mono, 8000 Hz, 4 próbki).
+    var w24: List[u8];
+    tekstBajty(&w24, "RIFF");
+    le(&w24, 36 + 12, 4);
+    tekstBajty(&w24, "WAVEfmt ");
+    le(&w24, 16, 4);
+    le(&w24, 1, 2);
+    le(&w24, 1, 2);
+    le(&w24, 8000, 4);
+    le(&w24, 24000, 4);
+    le(&w24, 3, 2);
+    le(&w24, 24, 2);
+    tekstBajty(&w24, "data");
+    le(&w24, 12, 4);
+    le(&w24, 8388607, 3);
+    le(&w24, 8388608, 3);
+    le(&w24, 4194304, 3);
+    le(&w24, 256, 3);
+    b += sprawdz(zapiszBajty("pcm24.wav", &w24), "przygotowanie recznego pliku WAV 24-bit");
+    var p = sndfile.otworzDoOdczytu("pcm24.wav");
+    b += sprawdz(sndfile.otwarty(&p) and p.info.ramki == 4 and tekstRowny(sndfile.kodowanie(&p.info), "PCM_24") and not sndfile.jestWavPcm16(&p.info), "WAV 24-bit: rozpoznane kodowanie PCM_24 (to nie PCM16)");
+    let o = sndfile.czytajRamki(&p, 4);
+    b += sprawdz(o.ok and o.ramki == 4 and o.probki.at(0) == 32767i16 and o.probki.at(1) == -32768i16 and o.probki.at(2) == 16384i16 and o.probki.at(3) == 1i16, "WAV 24-bit przeliczony na i16 (32767, -32768, 16384, 1)");
+    sndfile.zamknij(&p);
+    return b;
+}
+
+fun tekstRowny(a: str, b: str) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a[i] != b[i]) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun testyBledow() -> i64 = {
+    var b: i64 = 0;
+    var brak = sndfile.otworzDoOdczytu("nie-ma-takiego-pliku.wav");
+    b += sprawdz(not sndfile.otwarty(&brak) and zawiera(brak.blad.asSlice(), "nie-ma-takiego-pliku.wav") and brak.blad.length() > 40, "brakujacy plik: komunikat z nazwa i opisem libsndfile");
+    print(f"  ({brak.blad.asSlice()})\n");
+    var tekst: List[u8];
+    tekstBajty(&tekst, "To nie jest plik dzwiekowy, tylko zwykly tekst.\n");
+    zapiszBajty("tekst.wav", &tekst);
+    var t = sndfile.otworzDoOdczytu("tekst.wav");
+    b += sprawdz(not sndfile.otwarty(&t) and zawiera(t.blad.asSlice(), "tekst.wav"), "plik tekstowy zamiast dzwieku: odrzucony z opisem");
+    print(f"  ({t.blad.asSlice()})\n");
+    var uciety: List[u8];
+    tekstBajty(&uciety, "RIFF");
+    zapiszBajty("uciety.wav", &uciety);
+    var u = sndfile.otworzDoOdczytu("uciety.wav");
+    b += sprawdz(not sndfile.otwarty(&u), "uciety naglowek WAV odrzucony");
+    var zapis = sndfile.utworzWav16("tryby.wav", 8000, 2);
+    let odczytZZapisu = sndfile.czytajRamki(&zapis, 1);
+    let przewinZapis = sndfile.przewin(&zapis, 0);
+    b += sprawdz(not odczytZZapisu.ok and not przewinZapis.ok, "odczyt i przewijanie pliku otwartego do zapisu odrzucone");
+    var dwie: List[i16];
+    dwie.push(5i16);
+    dwie.push(-5i16);
+    let dobry = sndfile.zapiszRamki(&zapis, &dwie);
+    var trzy = copy dwie;
+    trzy.push(7i16);
+    let niepelny = sndfile.zapiszRamki(&zapis, &trzy);
+    var nic: List[i16];
+    let pustyZapis = sndfile.zapiszRamki(&zapis, &nic);
+    b += sprawdz(dobry.ok and not niepelny.ok and zawiera(niepelny.blad.asSlice(), "nic nie zapisano") and zapis.info.ramki == 1 and pustyZapis.ok, "niepelna ramka odrzucona bez zapisu; pusta lista to poprawny brak zapisu");
+    let zz = sndfile.zamknij(&zapis);
+    let poZamknieciu = sndfile.zapiszRamki(&zapis, &dwie);
+    let drugieZamkniecie = sndfile.zamknij(&zapis);
+    b += sprawdz(zz.ok and not poZamknieciu.ok and not drugieZamkniecie.ok and zawiera(drugieZamkniecie.blad.asSlice(), "nie jest otwarty"), "po zamknieciu zapis i ponowne zamkniecie zwracaja blad");
+    var r = sndfile.otworzDoOdczytu("tryby.wav");
+    let zapisDoOdczytu = sndfile.zapiszRamki(&r, &dwie);
+    let jedna = sndfile.czytajRamki(&r, 10);
+    b += sprawdz(not zapisDoOdczytu.ok and jedna.ok and jedna.ramki == 1 and jedna.probki.at(0) == 5i16 and jedna.probki.at(1) == -5i16, "zapis do pliku otwartego do odczytu odrzucony; w pliku jest tylko 1 poprawna ramka");
+    sndfile.zamknij(&r);
+    let odczytZamknietego = sndfile.czytajRamki(&r, 1);
+    b += sprawdz(not odczytZamknietego.ok and zawiera(odczytZamknietego.blad.asSlice(), "nie jest otwarty"), "odczyt zamknietego pliku: blad");
+    return b;
+}
+
+fun main() -> i64 = {
+    var bledy: i64 = 0;
+    bledy += testyParametrow();
+    bledy += testyStereo();
+    bledy += testyKanalow();
+    bledy += testyBajtow();
+    bledy += testyBledow();
+    print(f"Bledy: {bledy}\n");
+    return bledy;
+}

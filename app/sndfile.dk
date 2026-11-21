@@ -1,0 +1,377 @@
+#{
+    sndfile: wrapper biblioteki libsndfile (1.2.2) dla Ducklinga - odczyt i zapis plików
+    dźwiękowych, w szczególności WAV PCM16 (16 bitów na próbkę, bez kompresji).
+
+    Użytkownik nie widzi szczegółów C: funkcje przyjmują i zwracają zwykłe typy Ducklinga
+    (str, i64, bool, String, List[i16]), ścieżek nie trzeba kończyć znakiem '\0', a pamięć
+    na bufory wrapper przydziela i zwalnia sam w każdym wywołaniu.
+
+    Pojęcia:
+    * ramka  - po jednej próbce na każdy kanał (w stereo ramka to 2 próbki),
+    * próbka - jedna liczba i16 dla jednego kanału.
+    Bufor próbek jest przeplatany: próbka kanału c w ramce r ma indeks r * kanały + c
+    (stereo: L0, P0, L1, P1, ...). Liczby ramek i pozycje (przewijanie) liczymy w ramkach.
+
+    Kto zamyka plik: obiekt Plik zwrócony przez otworzDoOdczytu albo utworzWav16 trzyma
+    otwarty plik libsndfile; wywołujący musi wywołać zamknij(&plik) dokładnie raz. Po
+    zamknięciu (także po nieudanym zamknięciu) każda operacja zwraca błąd. Wyniki odczytu
+    (List[i16]) należą do wywołującego i są ważne także po zamknięciu pliku.
+
+    Błędy: żadna funkcja nie przerywa programu. Funkcje zwracają obiekt z polem ok (albo
+    otwarty() dla pliku) i polem blad z opisem po polsku; komunikat libsndfile jest dołączony
+    tam, gdzie biblioteka go podaje.
+
+    Uchwyt SNDFILE* przechowujemy jako liczbę u64 (w ABI 64-bitowych systemów, Linux x86_64
+    i macOS arm64, wskaźnik i u64 przekazuje się tak samo), dzięki czemu NULL to po prostu 0
+    i wrapper nie potrzebuje kodu w C. Wariant DVM nie jest obsługiwany.
+#}
+import core.containers.*;
+import core.builtins as builtins;
+import core.clib as clib;
+
+extern("C") {
+    class SF_INFO {
+        frames: i64;
+        samplerate: i32;
+        channels: i32;
+        format: i32;
+        sections: i32;
+        seekable: i32;
+    }
+    fundecl sf_open(sciezka: cptr char, tryb: i32, info: cptr SF_INFO) -> u64;
+    fundecl sf_close(plik: u64) -> i32;
+    fundecl sf_readf_short(plik: u64, bufor: cptr i16, ramki: i64) -> i64;
+    fundecl sf_writef_short(plik: u64, bufor: cptr i16, ramki: i64) -> i64;
+    fundecl sf_seek(plik: u64, ramki: i64, skad: i32) -> i64;
+    fundecl sf_strerror(plik: u64) -> cptr char;
+    fundecl sf_format_check(info: cptr SF_INFO) -> i32;
+    fundecl sf_version_string() -> cptr char;
+    fundecl strlen(s: cptr char) -> u64;
+}
+
+# Stałe z sndfile.h (1.2.2).
+const SFM_READ: i32 = 16;            # 0x10
+const SFM_WRITE: i32 = 32;           # 0x20
+const SF_FORMAT_WAV: i64 = 65536;    # 0x010000
+const SF_FORMAT_PCM_16: i64 = 2;
+const SF_FORMAT_TYPEMASK: i64 = 268369920;   # 0x0FFF0000
+const SF_FORMAT_SUBMASK: i64 = 65535;        # 0x0000FFFF
+const SEEK_SET: i32 = 0;
+
+# Granice sprawdzane przez wrapper.
+const MAKS_KANALOW: i64 = 1024;               # SF_MAX_CHANNELS w libsndfile
+const MIN_CZESTOTLIWOSC: i64 = 1;
+const MAKS_CZESTOTLIWOSC: i64 = 768000;
+const MAKS_PROBEK_W_PORCJI: i64 = 16777216;   # 32 MiB bufora na jedno wywołanie
+
+# Tryby pliku.
+const ZAMKNIETY: i32 = 0;
+const DO_ODCZYTU: i32 = 1;
+const DO_ZAPISU: i32 = 2;
+
+class Info {
+    czestotliwosc: i64 = 0;   # próbek na sekundę na kanał
+    kanaly: i64 = 0;
+    ramki: i64 = 0;           # liczba ramek w pliku (przy zapisie: dotąd zapisanych)
+    format: i64 = 0;          # pełny kod formatu libsndfile (typ | kodowanie)
+    przewijalny: bool = false;
+}
+
+class Plik {
+    uchwyt: u64 = 0u64;       # wewnętrzny uchwyt libsndfile - nie zmieniać
+    tryb: i32 = ZAMKNIETY;
+    info: Info = Info();
+    pozycja: i64 = 0;         # odczyt: numer następnej ramki; zapis: liczba zapisanych ramek
+    sciezka: String;
+    blad: String;             # opis błędu, gdy otwarcie się nie udało
+}
+
+class Wynik {
+    ok: bool = false;
+    blad: String;
+}
+
+class Odczyt {
+    ok: bool = false;
+    probki: List[i16];        # przeplatane: ramki * kanały próbek
+    ramki: i64 = 0;           # liczba odczytanych ramek
+    koniec: bool = false;     # odczytano mniej ramek niż żądano: dalej nie ma danych
+    blad: String;
+}
+
+fun otwarty(p: ref Plik) -> bool = p.tryb != ZAMKNIETY;
+
+# Tekst w stylu C (zakończony zerem) zamieniony na String.
+fun zC(tekst: cptr char) -> String = {
+    var wynik: String;
+    if (tekst as u64 == 0u64) return wynik;
+    let n = strlen(tekst) as i64;
+    wynik.append(builtins.slice_from_ptr_len[char](tekst as manyptr char, n));
+    return wynik;
+}
+
+fun naC(tekst: str) -> String = {
+    var wynik: String;
+    wynik.append(tekst);
+    wynik.append('\0');
+    return wynik;
+}
+
+fun komunikatBiblioteki(uchwyt: u64) -> String = zC(sf_strerror(uchwyt));
+
+# Wersja biblioteki, np. "libsndfile-1.2.2".
+fun wersjaBiblioteki() -> String = zC(sf_version_string());
+
+fun typFormatu(info: ref Info) -> str = {
+    let typ = info.format & SF_FORMAT_TYPEMASK;
+    if (typ == 65536) return "WAV";
+    if (typ == 131072) return "AIFF";
+    if (typ == 196608) return "AU";
+    if (typ == 262144) return "RAW";
+    if (typ == 720896) return "W64";
+    if (typ == 1507328) return "FLAC";
+    if (typ == 2097152) return "OGG";
+    return "inny";
+}
+
+fun kodowanie(info: ref Info) -> str = {
+    let kod = info.format & SF_FORMAT_SUBMASK;
+    if (kod == 1) return "PCM_S8";
+    if (kod == 2) return "PCM_16";
+    if (kod == 3) return "PCM_24";
+    if (kod == 4) return "PCM_32";
+    if (kod == 5) return "PCM_U8";
+    if (kod == 6) return "FLOAT";
+    if (kod == 7) return "DOUBLE";
+    if (kod == 16) return "ULAW";
+    if (kod == 17) return "ALAW";
+    if (kod == 18) return "IMA_ADPCM";
+    if (kod == 19) return "MS_ADPCM";
+    if (kod == 96) return "VORBIS";
+    return "inne";
+}
+
+fun jestWavPcm16(info: ref Info) -> bool = (info.format & SF_FORMAT_TYPEMASK) == SF_FORMAT_WAV and (info.format & SF_FORMAT_SUBMASK) == SF_FORMAT_PCM_16;
+
+fun czasSekund(info: ref Info) -> i64 = {
+    if (info.czestotliwosc <= 0) return 0;
+    return info.ramki / info.czestotliwosc;
+}
+
+# Czy libsndfile przyjmie WAV PCM16 o takich parametrach (bez tworzenia pliku).
+fun formatPoprawny(czestotliwosc: i64, kanaly: i64) -> bool = {
+    if (czestotliwosc < MIN_CZESTOTLIWOSC or czestotliwosc > MAKS_CZESTOTLIWOSC) return false;
+    if (kanaly < 1 or kanaly > MAKS_KANALOW) return false;
+    var info = SF_INFO(0, czestotliwosc as i32, kanaly as i32, (SF_FORMAT_WAV | SF_FORMAT_PCM_16) as i32, 0i32, 0i32);
+    return sf_format_check(&info as cptr SF_INFO) != 0i32;
+}
+
+#{
+    Otwiera plik dźwiękowy do odczytu (WAV i inne formaty obsługiwane przez libsndfile;
+    próbki są zawsze zwracane jako i16). Gdy się nie uda, otwarty(&plik) == false, a
+    plik.blad opisuje przyczynę (np. brak pliku albo nierozpoznany format).
+#}
+fun otworzDoOdczytu(sciezka: str) -> Plik = {
+    var p: Plik;
+    p.sciezka.append(sciezka);
+    if (sciezka.length() == 0) {
+        p.blad.append("pusta sciezka pliku");
+        return p;
+    }
+    let nazwa = naC(sciezka);
+    var info = SF_INFO(0, 0i32, 0i32, 0i32, 0i32, 0i32);
+    let uchwyt = sf_open(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, SFM_READ, &info as cptr SF_INFO);
+    if (uchwyt == 0u64) {
+        let opis = komunikatBiblioteki(0u64);
+        p.blad.append(f"nie mozna otworzyc '{sciezka}' do odczytu: {opis.asSlice()}");
+        return p;
+    }
+    p.uchwyt = uchwyt;
+    p.tryb = DO_ODCZYTU;
+    p.info.czestotliwosc = info.samplerate as i64;
+    p.info.kanaly = info.channels as i64;
+    p.info.ramki = info.frames;
+    p.info.format = info.format as i64;
+    p.info.przewijalny = info.seekable != 0i32;
+    return p;
+}
+
+#{
+    Tworzy nowy plik WAV PCM16 do zapisu (istniejący plik o tej nazwie zostanie zastąpiony).
+    Wymaga częstotliwości 1..768000 Hz i 1..1024 kanałów.
+#}
+fun utworzWav16(sciezka: str, czestotliwosc: i64, kanaly: i64) -> Plik = {
+    var p: Plik;
+    p.sciezka.append(sciezka);
+    if (sciezka.length() == 0) {
+        p.blad.append("pusta sciezka pliku");
+        return p;
+    }
+    if (czestotliwosc < MIN_CZESTOTLIWOSC or czestotliwosc > MAKS_CZESTOTLIWOSC) {
+        p.blad.append(f"czestotliwosc {czestotliwosc} Hz poza zakresem {MIN_CZESTOTLIWOSC}..{MAKS_CZESTOTLIWOSC}");
+        return p;
+    }
+    if (kanaly < 1 or kanaly > MAKS_KANALOW) {
+        p.blad.append(f"liczba kanalow {kanaly} poza zakresem 1..{MAKS_KANALOW}");
+        return p;
+    }
+    var info = SF_INFO(0, czestotliwosc as i32, kanaly as i32, (SF_FORMAT_WAV | SF_FORMAT_PCM_16) as i32, 0i32, 0i32);
+    if (sf_format_check(&info as cptr SF_INFO) == 0i32) {
+        p.blad.append(f"libsndfile odrzuca WAV PCM16 {czestotliwosc} Hz, {kanaly} kan.");
+        return p;
+    }
+    let nazwa = naC(sciezka);
+    let uchwyt = sf_open(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, SFM_WRITE, &info as cptr SF_INFO);
+    if (uchwyt == 0u64) {
+        let opis = komunikatBiblioteki(0u64);
+        p.blad.append(f"nie mozna utworzyc '{sciezka}': {opis.asSlice()}");
+        return p;
+    }
+    p.uchwyt = uchwyt;
+    p.tryb = DO_ZAPISU;
+    p.info.czestotliwosc = czestotliwosc;
+    p.info.kanaly = kanaly;
+    p.info.ramki = 0;
+    p.info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+    p.info.przewijalny = true;
+    return p;
+}
+
+fun bladOdczytu(komunikat: str) -> Odczyt = {
+    var o: Odczyt;
+    o.blad.append(komunikat);
+    return o;
+}
+
+fun bladWyniku(komunikat: str) -> Wynik = {
+    var w: Wynik;
+    w.blad.append(komunikat);
+    return w;
+}
+
+#{
+    Odczyt kolejnej porcji: najwyżej ileRamek ramek od bieżącej pozycji. Zwraca przeplatane
+    próbki (ramki * kanały). Na końcu danych zwraca mniej ramek i koniec = true; kolejne
+    wywołanie zwróci 0 ramek. ileRamek >= 1, a ileRamek * kanały <= 16 777 216.
+#}
+fun czytajRamki(p: ref Plik, ileRamek: i64) -> Odczyt = {
+    if (p.tryb != DO_ODCZYTU) {
+        if (p.tryb == ZAMKNIETY) return bladOdczytu("plik nie jest otwarty");
+        return bladOdczytu("plik jest otwarty do zapisu, nie do odczytu");
+    }
+    if (ileRamek < 1) return bladOdczytu(f"liczba ramek musi byc dodatnia (jest {ileRamek})".asSlice());
+    let kanaly = p.info.kanaly;
+    if (ileRamek > MAKS_PROBEK_W_PORCJI / kanaly) {
+        return bladOdczytu(f"porcja {ileRamek} ramek x {kanaly} kanalow przekracza {MAKS_PROBEK_W_PORCJI} probek".asSlice());
+    }
+    let probek = ileRamek * kanaly;
+    let pamiec = clib.malloc((probek * 2) as u64);
+    if (pamiec as u64 == 0u64) return bladOdczytu("brak pamieci na bufor odczytu");
+    let n = sf_readf_short(p.uchwyt, pamiec as cptr i16, ileRamek);
+    var o: Odczyt;
+    if (n < 0) {
+        let opis = komunikatBiblioteki(p.uchwyt);
+        o.blad.append(f"blad odczytu: {opis.asSlice()}");
+    } else {
+        let bufor = pamiec as manyptr i16;
+        o.probki.reserve(n * kanaly);
+        var i: i64 = 0;
+        while (i < n * kanaly) {
+            o.probki.push(bufor[i]);
+            i += 1;
+        }
+        o.ramki = n;
+        o.koniec = n < ileRamek;
+        o.ok = true;
+        p.pozycja += n;
+    }
+    clib.free(pamiec);
+    return o;
+}
+
+#{
+    Zapis przeplatanych próbek na końcu pliku. Liczba próbek musi być wielokrotnością liczby
+    kanałów (pełne ramki). Sprawdza, ile ramek libsndfile naprawdę zapisała; przy błędzie
+    część ramek mogła trafić do pliku (opis podaje ile).
+#}
+fun zapiszRamki(p: ref Plik, probki: ref List[i16]) -> Wynik = {
+    if (p.tryb != DO_ZAPISU) {
+        if (p.tryb == ZAMKNIETY) return bladWyniku("plik nie jest otwarty");
+        return bladWyniku("plik jest otwarty do odczytu, nie do zapisu");
+    }
+    let kanaly = p.info.kanaly;
+    let liczba = probki.length();
+    if (liczba % kanaly != 0) {
+        return bladWyniku(f"{liczba} probek to nie pelne ramki ({kanaly} kanaly) - nic nie zapisano".asSlice());
+    }
+    if (liczba > MAKS_PROBEK_W_PORCJI) return bladWyniku(f"porcja {liczba} probek przekracza {MAKS_PROBEK_W_PORCJI}".asSlice());
+    var w: Wynik;
+    if (liczba == 0) {
+        w.ok = true;
+        return w;
+    }
+    let ramki = liczba / kanaly;
+    let pamiec = clib.malloc((liczba * 2) as u64);
+    if (pamiec as u64 == 0u64) return bladWyniku("brak pamieci na bufor zapisu");
+    let bufor = pamiec as manyptr i16;
+    var i: i64 = 0;
+    while (i < liczba) {
+        bufor[i] = probki.at(i);
+        i += 1;
+    }
+    let zapisane = sf_writef_short(p.uchwyt, pamiec as cptr i16, ramki);
+    clib.free(pamiec);
+    if (zapisane > 0) {
+        p.pozycja += zapisane;
+        p.info.ramki += zapisane;
+    }
+    if (zapisane != ramki) {
+        let opis = komunikatBiblioteki(p.uchwyt);
+        w.blad.append(f"zapisano {zapisane} z {ramki} ramek: {opis.asSlice()}");
+        return w;
+    }
+    w.ok = true;
+    return w;
+}
+
+# Przesunięcie pozycji odczytu na ramkę 0..info.ramki (info.ramki = koniec danych).
+fun przewin(p: ref Plik, ramka: i64) -> Wynik = {
+    if (p.tryb != DO_ODCZYTU) {
+        if (p.tryb == ZAMKNIETY) return bladWyniku("plik nie jest otwarty");
+        return bladWyniku("przewijanie dotyczy plikow otwartych do odczytu");
+    }
+    if (ramka < 0 or ramka > p.info.ramki) {
+        return bladWyniku(f"ramka {ramka} poza zakresem 0..{p.info.ramki}".asSlice());
+    }
+    let wynik = sf_seek(p.uchwyt, ramka, SEEK_SET);
+    if (wynik != ramka) {
+        let opis = komunikatBiblioteki(p.uchwyt);
+        return bladWyniku(f"przewijanie nie powiodlo sie: {opis.asSlice()}".asSlice());
+    }
+    p.pozycja = ramka;
+    var w: Wynik;
+    w.ok = true;
+    return w;
+}
+
+#{
+    Zamyka plik i zwalnia uchwyt libsndfile. Przy zapisie dopiero zamknięcie uzupełnia
+    nagłówek WAV, więc trzeba sprawdzić wynik. Po wywołaniu plik jest zamknięty także
+    wtedy, gdy zamknięcie zgłosiło błąd; ponowne zamknięcie zwraca błąd "plik nie jest otwarty".
+#}
+fun zamknij(p: ref Plik) -> Wynik = {
+    if (p.tryb == ZAMKNIETY) return bladWyniku("plik nie jest otwarty");
+    let kod = sf_close(p.uchwyt);
+    p.uchwyt = 0u64;
+    p.tryb = ZAMKNIETY;
+    if (kod != 0i32) {
+        let opis = komunikatBiblioteki(0u64);
+        return bladWyniku(f"zamkniecie '{p.sciezka.asSlice()}' zwrocilo kod {kod}: {opis.asSlice()}".asSlice());
+    }
+    var w: Wynik;
+    w.ok = true;
+    return w;
+}
+
+# Próbka kanału w ramce z przeplatanego bufora.
+fun probka(probki: ref List[i16], kanaly: i64, ramka: i64, kanal: i64) -> i16 = probki.at(ramka * kanaly + kanal);

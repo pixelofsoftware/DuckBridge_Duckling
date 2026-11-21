@@ -1,0 +1,118 @@
+#{
+    Przykład podstawowy: zapis i odczyt pliku WAV PCM16 przez publiczne API wrappera.
+
+    1. Tworzy ton-stereo.wav: 1 s, 44 100 Hz, 2 kanały (lewy 440 Hz, prawy 660 Hz, z próbkami
+       ujemnymi), zapisany w 10 porcjach.
+    2. Otwiera plik ponownie, wypisuje informacje i pierwsze ramki, przewija na ramkę 11111 (ok. 0,25 s) i czyta
+       resztę porcjami aż do końca danych.
+    3. Pokazuje dwa kontrolowane błędy: brak pliku i porcję, która nie jest pełnymi ramkami.
+    Kod zakończenia: liczba niezgodności (0 = wszystko jak oczekiwano).
+#}
+import core.containers.*;
+import std.math as math;
+import sndfile;
+
+const CZESTOTLIWOSC: i64 = 44100;
+const KANALY: i64 = 2;
+let PLIK = "ton-stereo.wav";
+
+fun ton(ramka: i64, hz: f64, amplituda: f64) -> i16 = {
+    let t = (ramka as f64) / (CZESTOTLIWOSC as f64);
+    let wartosc = amplituda * 32767.0f64 * math.sin(2.0f64 * 3.141592653589793f64 * hz * t);
+    if (wartosc >= 0.0f64) return (wartosc + 0.5f64) as i16;
+    return (wartosc - 0.5f64) as i16;
+}
+
+fun main() -> i64 = {
+    var bledy: i64 = 0;
+    let wersja = sndfile.wersjaBiblioteki();
+    print(f"Biblioteka: {wersja.asSlice()}\n");
+
+    # 1. Zapis porcjami.
+    var plik = sndfile.utworzWav16(PLIK, CZESTOTLIWOSC, KANALY);
+    if (not sndfile.otwarty(&plik)) {
+        print(f"Blad: {plik.blad.asSlice()}\n");
+        return 1;
+    }
+    var porcja: i64 = 0;
+    while (porcja < 10) {
+        var probki: List[i16];
+        var r: i64 = porcja * 4410;
+        while (r < (porcja + 1) * 4410) {
+            probki.push(ton(r, 440.0f64, 0.5f64));     # lewy
+            probki.push(ton(r, 660.0f64, 0.25f64));    # prawy
+            r += 1;
+        }
+        let zapis = sndfile.zapiszRamki(&plik, &probki);
+        if (not zapis.ok) {
+            print(f"Blad zapisu: {zapis.blad.asSlice()}\n");
+            bledy += 1;
+        }
+        porcja += 1;
+    }
+    let zamkniecie = sndfile.zamknij(&plik);
+    print(f"Zapisano {PLIK}: {plik.info.ramki} ramek, zamkniecie: {zamkniecie.ok}\n");
+    if (not zamkniecie.ok) bledy += 1;
+
+    # 2. Odczyt.
+    var odczyt = sndfile.otworzDoOdczytu(PLIK);
+    if (not sndfile.otwarty(&odczyt)) {
+        print(f"Blad: {odczyt.blad.asSlice()}\n");
+        return bledy + 1;
+    }
+    let info = odczyt.info;
+    print(f"Odczyt: {sndfile.typFormatu(&odczyt.info)} {sndfile.kodowanie(&odczyt.info)}, {info.czestotliwosc} Hz, {info.kanaly} kanaly, {info.ramki} ramek ({sndfile.czasSekund(&odczyt.info)} s), {info.ramki * info.kanaly} probek\n");
+    if (info.ramki != CZESTOTLIWOSC or info.kanaly != KANALY or not sndfile.jestWavPcm16(&odczyt.info)) bledy += 1;
+    let poczatek = sndfile.czytajRamki(&odczyt, 4);
+    print(f"Pierwsze {poczatek.ramki} ramki (lewy, prawy):");
+    var i: i64 = 0;
+    while (i < poczatek.ramki) {
+        print(f" ({sndfile.probka(&poczatek.probki, KANALY, i, 0)}, {sndfile.probka(&poczatek.probki, KANALY, i, 1)})");
+        i += 1;
+    }
+    print("\n");
+    let przewiniecie = sndfile.przewin(&odczyt, 11111);
+    let cwierc = sndfile.czytajRamki(&odczyt, 2);
+    print(f"Po przewinieciu na ramke 11111: lewy {sndfile.probka(&cwierc.probki, KANALY, 0, 0)}, prawy {sndfile.probka(&cwierc.probki, KANALY, 0, 1)} (oczekiwane {ton(11111, 440.0f64, 0.5f64)}, {ton(11111, 660.0f64, 0.25f64)})\n");
+    if (not przewiniecie.ok or sndfile.probka(&cwierc.probki, KANALY, 0, 0) != ton(11111, 440.0f64, 0.5f64)) bledy += 1;
+    var reszta: i64 = 0;
+    var porcji: i64 = 0;
+    var najmniejsza: i16 = 0i16;
+    var dalej = true;
+    while (dalej) {
+        let kawalek = sndfile.czytajRamki(&odczyt, 10000);
+        if (not kawalek.ok) {
+            dalej = false;
+            bledy += 1;
+        } else {
+            reszta += kawalek.ramki;
+            porcji += 1;
+            var k: i64 = 0;
+            while (k < kawalek.probki.length()) {
+                if (kawalek.probki.at(k) < najmniejsza) najmniejsza = kawalek.probki.at(k);
+                k += 1;
+            }
+            dalej = not kawalek.koniec;
+        }
+    }
+    print(f"Reszta pliku: {reszta} ramek w {porcji} porcjach; pozycja na koniec {odczyt.pozycja}; najmniejsza probka {najmniejsza}\n");
+    if (odczyt.pozycja != CZESTOTLIWOSC or reszta != CZESTOTLIWOSC - 11113) bledy += 1;
+    let koniec = sndfile.zamknij(&odczyt);
+    if (not koniec.ok) bledy += 1;
+
+    # 3. Kontrolowane błędy.
+    var brak = sndfile.otworzDoOdczytu("nie-ma-takiego-pliku.wav");
+    print(f"Proba otwarcia brakujacego pliku: {brak.blad.asSlice()}\n");
+    if (sndfile.otwarty(&brak)) bledy += 1;
+    var drugi = sndfile.utworzWav16("niepelne-ramki.wav", 8000, 2);
+    var trzy: List[i16];
+    trzy.push(1i16);
+    trzy.push(2i16);
+    trzy.push(3i16);
+    let zly = sndfile.zapiszRamki(&drugi, &trzy);
+    print(f"Proba zapisu 3 probek do pliku stereo: {zly.blad.asSlice()}\n");
+    if (zly.ok) bledy += 1;
+    sndfile.zamknij(&drugi);
+    print(f"Niezgodnosci: {bledy}\n");
+    return bledy;
+}
