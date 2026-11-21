@@ -1,5 +1,7 @@
 # DuckBridge: sndfile - wrapper libsndfile dla Ducklinga
 
+![Napisane w Duckling](https://img.shields.io/badge/napisane%20w-Duckling-f2c94c)
+
 Zespół: Pixel of Software (Marcin Kowalczyk). Temat: P02 DuckBridge, biblioteka libsndfile (poziom 2). Skład: 1 osoba.
 
 Moduł `sndfile` (`app/sndfile.dk`) udostępnia w Ducklingu odczyt i zapis plików dźwiękowych, w szczególności WAV PCM16, przez bibliotekę C libsndfile. API przyjmuje i zwraca zwykłe typy Ducklinga. Użytkownik nie używa wskaźników, nie dopisuje `\0` i nie zwalnia pamięci. Zasoby zwalnia wrapper: bufory w każdym wywołaniu, a plik w `zamknij`.
